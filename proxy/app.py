@@ -1,5 +1,7 @@
 import asyncio
 import logging
+
+
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -8,12 +10,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from .config import config
+
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(module)s - %(message)s', level=config.log_level)
+logger = logging.getLogger(__name__)
 from .forwarder import forward_generate
 from .scanner import scan_loop
 from .state import get_all_backends
 
-logging.basicConfig(level=config.log_level)
-logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -22,7 +25,7 @@ async def lifespan(app: FastAPI):
         connect=config.backend_connect_timeout_seconds,
         read=config.backend_read_timeout_seconds,
         write=config.backend_read_timeout_seconds,
-        pool=None,
+        pool=60,
     )
     app.state.http_client = httpx.AsyncClient(timeout=timeout)
     scan_task = asyncio.create_task(scan_loop())

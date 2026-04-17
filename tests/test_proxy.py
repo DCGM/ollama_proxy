@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 
 from proxy.app import app
 from proxy import state as state_module
+from proxy.config import config
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +46,24 @@ def _reset_backends(ports: list[int], healthy: bool = False) -> None:
 def reset_state():
     """Isolate backend state between tests."""
     original = dict(state_module.backends)
+    orig_queue_timeout = config.queue_timeout_seconds
+    orig_max_concurrent = config.max_concurrent_per_backend
+    # Use short timeout and high concurrency to avoid blocking in tests.
+    config.queue_timeout_seconds = 2.0
+    config.max_concurrent_per_backend = 100
+    # Reset the asyncio synchronisation primitives so that Condition/Lock
+    # state does not leak between tests running on different event-loops.
+    orig_lock = state_module.state_lock
+    orig_cond = state_module._slots_available
+    state_module.state_lock = asyncio.Lock()
+    state_module._slots_available = asyncio.Condition(state_module.state_lock)
     yield
     state_module.backends.clear()
     state_module.backends.update(original)
+    config.queue_timeout_seconds = orig_queue_timeout
+    config.max_concurrent_per_backend = orig_max_concurrent
+    state_module.state_lock = orig_lock
+    state_module._slots_available = orig_cond
 
 
 @pytest.fixture()
@@ -381,3 +397,107 @@ class TestStateHelpers:
 
         await state_module.decrement_in_flight(24001)
         assert state_module.backends[24001].in_flight == 0
+
+
+# ---------------------------------------------------------------------------
+# Concurrency limiting / queue behaviour
+# ---------------------------------------------------------------------------
+
+class TestConcurrencyQueue:
+    @pytest.mark.asyncio
+    async def test_acquire_backend_respects_max_concurrent(self):
+        """Backend at capacity is skipped for one that has a free slot."""
+        config.max_concurrent_per_backend = 1
+        _reset_backends([24001, 24002], healthy=True)
+        state_module.backends[24001].in_flight = 1  # at capacity
+
+        async with state_module.acquire_backend(excluded=set(), timeout=5) as b:
+            assert b.port == 24002
+
+    @pytest.mark.asyncio
+    async def test_acquire_backend_waits_for_slot(self):
+        """Request queues when all backends are at capacity, proceeds when a
+        slot is freed."""
+        config.max_concurrent_per_backend = 1
+        _reset_backends([24001], healthy=True)
+        state_module.backends[24001].in_flight = 1  # at capacity
+
+        acquired = asyncio.Event()
+
+        async def acquire():
+            async with state_module.acquire_backend(
+                excluded=set(), timeout=5
+            ) as b:
+                acquired.set()
+                assert b.port == 24001
+
+        task = asyncio.create_task(acquire())
+        await asyncio.sleep(0.05)
+        assert not acquired.is_set(), "Should still be waiting"
+
+        # Free a slot – the waiter should proceed.
+        await state_module.decrement_in_flight(24001)
+        await asyncio.sleep(0.05)
+        assert acquired.is_set()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_acquire_backend_timeout_raises(self):
+        """Timeout while waiting raises BackendUnavailableError."""
+        config.max_concurrent_per_backend = 1
+        _reset_backends([24001], healthy=True)
+        state_module.backends[24001].in_flight = 1  # at capacity
+
+        with pytest.raises(state_module.BackendUnavailableError):
+            async with state_module.acquire_backend(
+                excluded=set(), timeout=0.1
+            ) as _:
+                pass  # pragma: no cover
+
+    @pytest.mark.asyncio
+    async def test_acquire_backend_notified_when_backend_becomes_healthy(self):
+        """A waiter blocked because all backends are unhealthy proceeds once
+        one is marked healthy by the scanner."""
+        config.max_concurrent_per_backend = 1
+        _reset_backends([24001], healthy=False)
+
+        acquired = asyncio.Event()
+
+        async def acquire():
+            async with state_module.acquire_backend(
+                excluded=set(), timeout=5
+            ) as b:
+                acquired.set()
+                assert b.port == 24001
+
+        task = asyncio.create_task(acquire())
+        await asyncio.sleep(0.05)
+        assert not acquired.is_set()
+
+        await state_module.mark_healthy(24001)
+        await asyncio.sleep(0.05)
+        assert acquired.is_set()
+        await task
+
+    @pytest.mark.asyncio
+    async def test_slot_released_on_context_exit(self):
+        """in_flight is decremented when the context manager exits."""
+        config.max_concurrent_per_backend = 2
+        _reset_backends([24001], healthy=True)
+
+        async with state_module.acquire_backend(
+            excluded=set(), timeout=5
+        ) as b:
+            assert state_module.backends[24001].in_flight == 1
+
+        assert state_module.backends[24001].in_flight == 0
+
+    def test_queue_timeout_returns_503(self, client):
+        """Full end-to-end: all backends at capacity → 503 after timeout."""
+        config.max_concurrent_per_backend = 1
+        config.queue_timeout_seconds = 0.2
+        _reset_backends([24001], healthy=True)
+        state_module.backends[24001].in_flight = 1
+
+        resp = client.post("/api/generate", json={"model": "m", "prompt": "hi"})
+        assert resp.status_code == 503
